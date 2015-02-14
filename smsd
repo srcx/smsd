@@ -1,0 +1,256 @@
+#!/usr/bin/perl -wT
+
+#
+# smsd - daemon wrapper around smssend
+# (c)2002,2003 Stepan Roh <src@srnet.cz>
+# Free to use and/or modify.
+#
+
+#
+# $Id: smsd,v 1.9 2003/01/29 19:49:36 stepan Exp $
+#
+
+# Bugs:
+# 0001 pid file is not removed on termination
+
+use strict;
+
+use Fcntl;
+use Sys::Syslog qw(:DEFAULT setlogsock);
+use POSIX;
+
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+my $smssend_bin = 'smssend';
+
+my $use_syslog = 1;
+setlogsock ('unix');
+openlog ('smsd', 'cons,pid', 'user');
+
+sub log_warn ($) {
+  my ($m) = @_;
+  if ($use_syslog) {
+    syslog ('warning', '%s', $m);
+  } else {
+    print STDERR $m;
+    if ($m !~ /\n$/) {
+      print STDERR "\n";
+    }
+  }
+}
+
+sub log_info ($) {
+  my ($m) = @_;
+  if ($use_syslog) {
+    syslog ('info', '%s', $m);
+  } else {
+    print STDERR $m;
+    if ($m !~ /\n$/) {
+      print STDERR "\n";
+    }
+  }
+}
+
+my $smsd_pid_file = '/var/run/smsd.pid';
+my $smsd_spool_dir = '/var/spool/smsd/';
+
+my $cvs_version = '$Revision: 1.9 $';
+my $version = '0.' . ($cvs_version =~ /:\s*(\S*)\s*\$/)[0];
+
+eval {
+
+sub print_help () {
+  print <<END;
+Usage: smsd [options]
+  --help            show this help
+  --version         show version information
+  --no-syslog       do not log errors to syslog but exit with error
+  --pid-file file   pid file location (default is $smsd_pid_file)
+  --spool-dir dir   spooling directory (default is $smsd_spool_dir)
+END
+}
+
+while (@ARGV) {
+  my $arg = shift @ARGV;
+  if ($arg eq '--version') {
+    print <<END;
+smsd version $version
+
+(c)2002,2003 Stepan Roh
+END
+    exit;
+  } elsif ($arg eq '--help') {
+    print_help();
+    exit;
+  } elsif ($arg eq '--no-syslog') {
+    $use_syslog = 0;
+  } elsif ($arg eq '--pid-file') {
+    $smsd_pid_file = shift @ARGV;
+    ($smsd_pid_file) = ($smsd_pid_file =~ /^(.*)$/); # avoid -T
+  } elsif ($arg eq '--spool-dir') {
+    $smsd_spool_dir = shift @ARGV;
+    ($smsd_spool_dir) = ($smsd_spool_dir =~ /^(.*)$/); # avoid -T
+  } else {
+    die "Unknown command-line argument $arg\n";
+  }
+}
+
+# smssend is not as quiet as tells (even with -q option)
+open (STDOUT, ">/dev/null");
+
+log_info ('Server started');
+
+# signals
+
+my $sig_mask = POSIX::SigSet->new (&POSIX::SIGUSR1);
+my $old_sig_mask = POSIX::SigSet->new ();
+
+my $interrupted = 0;
+
+sub catch_sig ($) {
+  my ($signame) = @_;
+  $interrupted = 1;
+}
+
+# block SIGUSR1
+sigprocmask (&POSIX::SIG_BLOCK, $sig_mask, $old_sig_mask);
+$SIG{'USR1'} = \&catch_sig;
+
+# pidfile
+
+my $pidfile_created = sysopen (PIDFILE, $smsd_pid_file, O_WRONLY()|O_CREAT()|O_EXCL());
+if (!$pidfile_created) {
+
+  open (PIDFILE, "<$smsd_pid_file") || die "Unable to open $smsd_pid_file : $!\n";
+  my $_pid = <PIDFILE>;
+  close (PIDFILE) || die "Unable to open $smsd_pid_file : $!\n";
+  my ($pid) = ($_pid =~ /^(.*)$/); # -T avoidance
+  chomp ($pid);
+  if (!(defined $pid) || ($pid eq '') || !kill (0, $pid)) {
+    log_warn ('Removing stale pid file with pid '.$pid);
+  } else {
+    die "Another smsd is already running with pid $pid\n";
+  }
+
+  open (PIDFILE, '>'.$smsd_pid_file) || die "Unable to create $smsd_pid_file : $!\n";
+}
+print PIDFILE $$ . "\n";
+close (PIDFILE) || die "Unable to close $smsd_pid_file : $!\n";
+
+# send message from file
+
+sub send_msg ($) {
+  my ($f) = @_;
+  
+  my $send = 1;
+  my ($in_message, $in_smssend);
+  
+  eval {
+
+    open (F, '<'.$f) || die "Unable to open file $f : $!\n";
+    while (<F>) {
+      chomp ($_);
+      next if (/^\s*(#|$)/);
+      my ($k, $v) = ($_ =~ /^\s*(\S+)\s+"(.*)"\s*$/);
+      if (!defined $k) {
+        die "Incorrect format of message file $f\n";
+      } elsif ($k eq 'smssend') {
+        $in_smssend = $v;
+      } elsif ($k eq 'message') {
+        $in_message = $v;
+      } else {
+        die "Unknown keyword $k in message file $f\n";
+      }
+    }
+    close (F) || die "Unable to close file $f : $!\n";
+  
+    if (!defined ($in_smssend) || !defined ($in_message)) {
+      die "Either smssend or message keyword is not specified in message file $f\n";
+    }
+
+  };
+  if ($@) {
+    # just to be sure
+    close (F);
+    log_warn ($@);
+    $send = 0;
+  }
+  
+  if ($send) {
+    my (@in_smssend) = split (/"\s*"/, $in_smssend);
+    
+    log_info ('Sending message to '.join (' ', @in_smssend).' (source '.$f.')');
+
+    system ($smssend_bin, '-q', @in_smssend, $in_message);
+    
+    my $exitval = $? >> 8;
+    # FIX: codes and timeouts tested only for paegas.sms
+    if ((($in_smssend[0] eq 'paegas') || ($in_smssend[0] eq 't-mobile'))
+    && ($exitval == 2)) {
+      # wait 2 min.
+      return 120;
+    } elsif ($exitval != 0) {
+      log_info ('Smssend reports unrecoverable error '.$exitval);
+    } else {
+      log_info ('Message sent successfully');
+    }
+  }
+  
+  remove ($f) || log_warn ("Unable to remove file $f : $!\n");
+  
+  return 0;
+}
+
+# queue processor
+
+sub process_queue () {
+
+  # one process is safe, because all signals are blocked and will be delivered
+  # later which will trigger executing of this function again
+
+  opendir (SPOOL, $smsd_spool_dir) || die "Unable to open directory $smsd_spool_dir : $!\n";
+  my @files = map { $smsd_spool_dir . $_ } sort grep { /\.msg$/ } readdir (SPOOL);
+  closedir (SPOOL) || die "Unable to close directory $smsd_spool_dir : $!\n";
+
+  foreach my $f (@files) {
+    ($f) = ($f =~ /^(.*)$/); # avoid -T
+    my $timeout;
+    while ($timeout = send_msg ($f)) {
+      log_info ('Waiting ' . $timeout . ' seconds');
+      sleep ($timeout);
+    }
+  }
+
+}
+
+# main loop
+
+while (1) {
+
+  process_queue ();
+  
+  log_info ('Waiting for SIGUSR1');
+  while (!$interrupted) {
+    # wait for signals
+    sigsuspend ($old_sig_mask);
+  }
+  log_info ('SIGUSR1 catched');
+  $interrupted = 0;
+
+}
+
+};
+
+if ($@) {
+  my $m = $@;
+  if ($use_syslog) {
+    syslog ('err', '%s', $m);
+  } else {
+    die "$m";
+  }
+}
+
+log_info ('Server stopped');
+
+closelog ();
+
+1;

@@ -1,0 +1,350 @@
+#!/usr/bin/perl -w
+#
+# smsdclient - send messages through smsd
+# (c) 2002,2003 Stepan Roh <src@srnet.cz>
+# Adapted from email2smssend (see below)
+#
+# email2smssend - send your emails to your GSM with smssend
+# Copyright (C) 2000 Jean-Baptiste Sarrodie (jaiguru@maldoror.freesurf.fr)
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+
+#
+# $Id: smsdclient,v 1.14 2003/02/20 09:35:39 stepan Exp $
+#
+
+use strict;
+
+use POSIX qw(mktime);
+use Sys::Syslog qw(:DEFAULT setlogsock);
+
+umask 0007;
+
+my $use_syslog = 1;
+setlogsock ('unix');
+openlog ('smsdclient', 'cons,pid', 'user');
+
+eval {
+
+my $smsd_pid_file = '/var/run/smsd.pid';
+my $smsd_spool_dir = '/var/spool/smsd/';
+my $home_dir = $ENV{'HOME'} || (getpwuid($<))[7];
+my $nosend_file = $home_dir.'/.smsdclient.nosend';
+
+# Don't edit after here
+my $cvs_version = '$Revision: 1.14 $';
+my $version = '0.' . ($cvs_version =~ /:\s*(\S*)\s*\$/)[0];
+my $header = 1;
+my $line;
+my $from_type = 'full';
+my ($from, $subject, $from_subject);
+my (@msg_info, $subject_info, $from_info, $from_mail, $from_user);
+my ($message, @tmp_messages, @messages);
+my ($limit_size, $limit_sms, $limit_subject, %from_list, @filters);
+my ($show_index, $reverse, $diff, $opt);
+my ($total_nb, $cpt, $prepend, $before, $after, @before__after);
+
+# Display usage help.  
+sub Usage {
+        print <<eof;
+Usage: smsdclient [options] -- [smssend options]
+  -ms, --msg-size       Maximum number of characters per message.
+  -mm, --max-msg        Maximum number of SMS by email (less than 9).
+  -ss, --subject-size	Maximum number of characters in mail subject
+  -ft, --from-type	Parsing type of from header (full (def.), mail, user)
+  -fl, --from-list	File with mapping shortcut=mail for from header
+  -ff, --filter-file	File with filters definition
+  -i, --index           Prefix the sms with sequence number
+  -r, --reverse         Send SMS in reverse order (some providers need it)
+  -h, --help            Display this help message.
+  -V, --version         Display version number.
+  --no-syslog		Do not log errors to syslog but exit with error
+  --pid-file		Location of smsd's pid file (def. $smsd_pid_file)
+  --spool-dir		Location of smsd's spooling directory (def. $smsd_spool_dir)
+  --nosend-file		Location of file preventing smsdclient from sending messages (def. $nosend_file)
+  smssend options       See "smssend --help" for list of options.
+
+eof
+	exit;
+}
+
+# Assign some vars
+$show_index = 0;
+$reverse = 0;
+$diff = 1;
+
+# Check command line args
+Usage if (scalar(@ARGV) == 0);
+
+while ($opt = shift (@ARGV)) {
+	if ($opt eq "-h" or $opt eq "--help") {
+		Usage;
+	} elsif ($opt eq '--no-syslog') {
+	  $use_syslog = 0;
+	} elsif ($opt eq '--pid-file') {
+	  $smsd_pid_file = shift (@ARGV);
+	} elsif ($opt eq '--spool-dir') {
+	  $smsd_spool_dir = shift (@ARGV);
+	} elsif ($opt eq '--nosend-file') {
+	  $nosend_file = shift (@ARGV);
+	} elsif ($opt eq "-ms" or $opt eq "--msg-size") {
+		$limit_size = shift (@ARGV);
+		die "msg-size needs to be an integer.\n" if (!($limit_size =~/^[0-9]+$/));
+	} elsif ($opt eq "-mm" or $opt eq "-max-msg") {
+		$limit_sms = shift (@ARGV);
+		die "max-msg needs to be an integer.\n" if (!($limit_sms =~/^[0-9]+$/));
+		die "max-msg must be less than 9.\n" if ($limit_sms > 9);
+	} elsif ($opt eq "-ss" or $opt eq "--subject-size") {
+		$limit_subject = shift (@ARGV);
+		die "subject-size needs to be an integer.\n" if (!($limit_subject =~/^[0-9]+$/));
+	} elsif ($opt eq "-ft" or $opt eq "--from-type") {
+		$from_type = shift (@ARGV);
+		die "Unknown from-type $from_type.\n" if ($from_type ne 'full')
+							&& ($from_type ne 'mail')
+							&& ($from_type ne 'user');
+	} elsif ($opt eq "-fl" or $opt eq "--from-list") {
+		my $from_list = shift (@ARGV);
+		open (LIST, $from_list) || die "Unable to open file $from_list : $!\n";
+		while (<LIST>) {
+		  chomp;
+		  next if /^\s*(#|$)/;
+		  my ($sc, $ma) = split (/=/, $_, 2);
+		  $from_list{lc($ma)} = $sc;
+		}
+		close (LIST);
+	} elsif ($opt eq "-ff" or $opt eq "--filter-file") {
+		my $filter_file = shift (@ARGV);
+		open (LIST, $filter_file) || die "Unable to open file $filter_file : $!\n";
+		while (<LIST>) {
+		  chomp;
+		  next if /^\s*(#|$)/;
+		  my ($v_header, $v_filter, $v_action) = split (/\s+/, $_, 3);
+		  push (@filters, {
+		    'header' => lc($v_header),
+		    'filter' => lc($v_filter),
+		    'action' => lc($v_action),
+		  });
+		}
+		close (LIST);
+	} elsif ($opt eq "-i" or $opt eq "--index") {
+		$show_index = 1;
+	} elsif ($opt eq "-r" or $opt eq "--reverse") {
+		$reverse = 1;
+	} elsif ($opt eq "-V" or $opt eq "--version") {
+		print <<eof;
+smsdclient version $version
+
+Copyright (C) 2000 Jean-Baptiste Sarrodie.
+Copyright (C) 2002,2003 Stepan Roh.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE,
+to the extent permitted by law.
+eof
+		exit;
+	} elsif ($opt eq "--") {
+		last;
+	} else {
+		die "Unrecognize option: $opt\n";
+	}
+}
+
+# Check msg_size and msg_max
+die "msg_size needs to be defined.\n" if (! defined($limit_size));
+die "max_msg needs to be defined.\n" if (! defined($limit_sms));
+
+if (-f $nosend_file) {
+  die "$nosend_file exists, message will not be sent\n";
+}
+
+# Now, options in @ARGV are for smssend
+
+my %headers = ();
+while (<STDIN>) {
+	chomp ($line = $_);
+
+	if ($header == 1) {
+		
+	        if ($line =~ /^(\S+?):\s*(.*?)\s*$/) {
+		  my ($header_name, $header_value) = ($1, $2);
+		  push (@{$headers{lc($header_name)}}, lc($header_value));
+		}
+
+        	if ($line =~ /^From:.*$/) {
+			$from = (split (/^From: /, $line))[1];
+		} elsif ($line =~ /^Subject:.*$/) {
+			$subject = (split (/^Subject: /, $line))[1];
+		} elsif ($line =~ /^$/) {
+			$header = 0;
+
+		    my $def;
+		    my $res_action = 'accept';
+		    L: foreach $def (@filters) {
+		      my $def_header = $$def{'header'};
+   	              my $def_filter = $$def{'filter'};
+   	              my $def_action = $$def{'action'};
+    		      if ($def_header eq '*') {
+    		        my $k;
+    		        foreach $k (keys %headers) {
+    		          my @values = @{$headers{$k}};
+    		          if ($def_filter eq '*') {
+                            $res_action = $def_action;
+                            last L;
+    		          } else {
+    		            my $val;
+    		            foreach $val (@values) {
+    		              if (index ($val, $def_filter) >= 0) {
+    		                $res_action = $def_action;
+    		                last L;
+    		              }
+    		            }
+    		          }
+    		        }
+    		      } else {
+    		        my @values = @{$headers{$def_header}};
+    		        if (@values) {
+    		          if ($def_filter eq '*') {
+                            $res_action = $def_action;
+                            last L;
+    		          } else {
+    		            my $val;
+    		            foreach $val (@values) {
+    		              if (index ($val, $def_filter) >= 0) {
+    		                $res_action = $def_action;
+    		                last L;
+    		              }
+    		            }
+    		          }
+    		        }
+    		      }
+    		    }
+    		    if ($res_action eq 'reject') {
+    		      exit 0;
+    		    }
+
+#			$from_subject = "From: $from - Subject: $subject - ";
+			@msg_info = ();
+			if ($from) {
+			  ($from_mail) = ($from =~ /<(.*?)>/);
+			  if (!$from_mail) {
+			    ($from_mail) = ($from =~ /^\s*(.*?)\s*$/);
+			  }
+			  ($from_user) = ($from_mail =~ /^(.*?)\@/);
+			  $from_info = $from_list{lc($from_mail)};
+			  if (!$from_info) {
+  			    if ($from_type eq 'mail') {
+			      $from_info = $from_mail;
+			    } elsif ($from_type eq 'user') {
+			      $from_info = $from_user;
+			    } else {
+			      $from_info = $from;
+			    }
+			  }
+			  push (@msg_info, 'F'.$from_info);
+			}
+			if ($subject) {
+			  if (defined $limit_subject) {
+			    $subject_info = substr ($subject, 0, $limit_subject);
+			  } else {
+  			    $subject_info = $subject;
+			  }
+			  push (@msg_info, 'S'.$subject_info);
+			}
+			$from_subject = join ('',@msg_info);
+			$from_subject .= '-' if ($from_subject);
+		}
+	} else {
+		$message .= "$line ";
+	}
+}
+
+$limit_size -= 5 if ($show_index == 1);
+
+(@tmp_messages) = (split (/(.{$limit_size})/, $from_subject . $message));
+foreach (@tmp_messages) {
+	if (!($_ =~ /^ *$/) && ($limit_sms-- > 0)) {
+		push (@messages, $_);
+	}
+}
+
+my @smssend_options = @ARGV;
+
+# Initialize cpt
+$total_nb = scalar(@messages);
+$cpt = 1;
+
+if ($reverse == 1) {
+	@messages = reverse (@messages) if ($reverse == 1);
+	$cpt = $total_nb;
+   $diff = -1;
+}
+
+sub create_msg_basename() {
+  my ($sec,$min,$hour,$day,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+  $mon += 1;
+  $year += 1900;
+  my $msg_id = sprintf ('%04d%02d%02d%02d%02d%02d%s', $year, $mon, $day, $hour, $min, $sec, $$);
+  return $smsd_spool_dir . $msg_id;
+}
+
+$prepend = '';
+
+foreach $message (@messages) {
+
+  $prepend = $cpt . "/$total_nb: " if ($show_index == 1);
+  $cpt += $diff;
+  my $full_message = $prepend . $message;
+
+  my $msg_basename = create_msg_basename();
+
+  my $msg_tmpfile = $msg_basename . '.tmp';
+  open (MSG, ">$msg_tmpfile") || die "Unable to open $msg_tmpfile : $!\n";
+  (print MSG 'smssend ' . join (' ', map { '"'.$_.'"'} @smssend_options) . "\n") || die "Unable to write to $msg_tmpfile : $!\n";
+  (print MSG 'message "' . $full_message . '"' . "\n") || die "Unable to write to $msg_tmpfile : $!\n";
+  close (MSG) || die "Unable to open $msg_tmpfile : $!\n";
+
+  my $msg_file = $msg_basename . '.msg';
+  rename ($msg_tmpfile, $msg_file) || die "Unable to rename $msg_tmpfile to $msg_file : $!\n";
+
+}
+
+if (@messages) {
+# possible only for communication with nonshared smsd
+#  open (PIDFILE, "<$smsd_pid_file") || die "Unable to open $smsd_pid_file : $!\n";
+#  my $pid = <PIDFILE>;
+#  close (PIDFILE) || die "Unable to open $smsd_pid_file : $!\n";
+#  chomp ($pid);
+#  if (!(defined $pid) || ($pid eq '') || !kill ('USR1', $pid)) {
+#    die "Unable to send signal SIGUSR1 to smsd[$pid]\n";
+#  }
+  system ('smsdwake');
+  if ($? >> 8) {
+    die "Unexpected error value ".($? >> 8)." returned from smsdwake\n";
+  }
+}
+
+};
+if ($@) {
+  my $m = $@;
+  if ($use_syslog) {
+    syslog ('err', '%s', $m);
+  } else {
+    die "$m";
+  }
+}
+
+closelog ();
+
+1;
