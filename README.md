@@ -1,11 +1,11 @@
 # smsd
 
+**Warning: unmaintained since 2003!**
+
 smsd is client/server system which allows more users to send message to
 mobile phones with the help of smssend utility (tested with version 3.1).
 Messages are queued and delivered at all events, which is good if mobile
 operator limits number or rate of messages sent from one IP address.
-
-**This utility is 10 years old and is not probably working anymore.**
 
 ## Compilation of smsdwake utility
 
